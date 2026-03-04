@@ -1,0 +1,209 @@
+
+"""
+Enrich 1s bars with funding rate, open interest, and liquidations.
+All columns are 1s-aligned and added to the same bar DataFrame.
+"""
+
+from pathlib import Path
+import gzip
+import json
+import urllib.request
+from collections import defaultdict
+from typing import Optional
+
+import pandas as pd
+
+from .config import Settings
+
+
+# Binance Futures REST (used when funding store is missing for range)
+FUNDING_RATE_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
+
+
+def _fetch_funding_rest(symbol: str, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
+    """Fetch funding rate history from Binance REST for the given range. Returns DataFrame with funding_time, funding_rate."""
+    start_ms = int(start_ts.timestamp() * 1000)
+    end_ms = int(end_ts.timestamp() * 1000)
+    url = f"{FUNDING_RATE_URL}?symbol={symbol}&startTime={start_ms}&endTime={end_ms}&limit=1000"
+    with urllib.request.urlopen(url) as r:
+        data = json.loads(r.read().decode())
+    if not data:
+        return pd.DataFrame(columns=["funding_time", "funding_rate"])
+    rows = [
+        {"funding_time": pd.to_datetime(d["fundingTime"], unit="ms", utc=True), "funding_rate": float(d["fundingRate"])}
+        for d in data
+    ]
+    return pd.DataFrame(rows)
+
+
+def _read_funding_store(symbol: str, start_ts: pd.Timestamp, end_ts: pd.Timestamp, funding_dir: str) -> Optional[pd.DataFrame]:
+    """Read funding from Parquet store for symbol and [start_ts, end_ts]. Returns None if file missing or empty range."""
+    path = Path(funding_dir) / f"{symbol}.parquet"
+    if not path.exists():
+        return None
+    df = pd.read_parquet(path)
+    if df.empty or "funding_time" not in df.columns:
+        return None
+    df["funding_time"] = pd.to_datetime(df["funding_time"], utc=True)
+    mask = (df["funding_time"] >= start_ts) & (df["funding_time"] <= end_ts)
+    out = df.loc[mask].copy()
+    return out if not out.empty else None
+
+
+def _ensure_funding_in_store(symbol: str, start_ts: pd.Timestamp, end_ts: pd.Timestamp, funding_dir: str) -> pd.DataFrame:
+    """Return funding DataFrame for range: from store if present, else fetch from REST and append to store."""
+    stored = _read_funding_store(symbol, start_ts, end_ts, funding_dir)
+    if stored is not None and len(stored) > 0:
+        return stored
+    fetched = _fetch_funding_rest(symbol, start_ts, end_ts)
+    if fetched.empty:
+        return fetched
+    path = Path(funding_dir) / f"{symbol}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        existing = pd.read_parquet(path)
+        existing["funding_time"] = pd.to_datetime(existing["funding_time"], utc=True)
+        combined = pd.concat([existing, fetched], ignore_index=True).drop_duplicates(subset=["funding_time"]).sort_values("funding_time")
+    else:
+        combined = fetched.sort_values("funding_time")
+    combined.to_parquet(path, index=False)
+    return fetched
+
+
+def _add_funding_column(df_bars: pd.DataFrame, symbol: str, start_ts: pd.Timestamp, end_ts: pd.Timestamp, funding_dir: str) -> None:
+    """Add funding_rate to df_bars (1s index), forward-filled from funding store or REST."""
+    funding_df = _ensure_funding_in_store(symbol, start_ts, end_ts, funding_dir)
+    if funding_df.empty:
+        df_bars["funding_rate"] = float("nan")
+        return
+    series = funding_df.set_index("funding_time")["funding_rate"]
+    target = df_bars.index.tz_localize("UTC") if df_bars.index.tz is None else df_bars.index
+    reindexed = series.reindex(target, method="ffill")
+    df_bars["funding_rate"] = reindexed.values
+
+
+def _read_oi_store(symbol: str, start_ts: pd.Timestamp, end_ts: pd.Timestamp, oi_dir: str) -> pd.Series:
+    """Read OI from Parquet for range; return Series index=ts, value=open_interest, or empty."""
+    path = Path(oi_dir) / f"{symbol}.parquet"
+    if not path.exists():
+        return pd.Series(dtype=float)
+    df = pd.read_parquet(path)
+    if df.empty or "ts" not in df.columns:
+        return pd.Series(dtype=float)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df = df.set_index("ts")
+    mask = (df.index >= start_ts) & (df.index <= end_ts)
+    out = df.loc[mask, "open_interest"]
+    return out
+
+
+def _add_oi_column(df_bars: pd.DataFrame, symbol: str, start_ts: pd.Timestamp, end_ts: pd.Timestamp, oi_dir: str) -> None:
+    """Add open_interest to df_bars, forward-filled from OI store."""
+    oi_series = _read_oi_store(symbol, start_ts, end_ts, oi_dir)
+    if oi_series.empty:
+        df_bars["open_interest"] = float("nan")
+        return
+    target = df_bars.index.tz_localize("UTC") if df_bars.index.tz is None else df_bars.index
+    oi_series = oi_series[~oi_series.index.duplicated(keep="last")].sort_index()
+    reindexed = oi_series.reindex(target, method="ffill")
+    df_bars["open_interest"] = reindexed.values
+
+
+def _aggregate_liquidations_from_raw(raw_path: Path, bar_index: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Read raw block file, collect liquidation records, aggregate to 1s buckets.
+    Returns DataFrame with index = bar_index, columns liq_vol_buy, liq_vol_sell, liq_count.
+    """
+    # Accumulate per-second: vol_buy, vol_sell, count
+    agg: dict = defaultdict(lambda: {"buy": 0.0, "sell": 0.0, "count": 0})
+
+    if not raw_path.exists():
+        return _liquidations_to_df(bar_index, agg)
+
+    def _ts_sec(rec: dict) -> Optional[int]:
+        data = rec.get("data") or {}
+        o = data.get("o") or {}
+        ms = o.get("T") or data.get("E")
+        if ms is None:
+            return None
+        return int(ms) // 1000
+
+    def _side(rec: dict) -> Optional[str]:
+        return (rec.get("data") or {}).get("o", {}).get("S")
+
+    def _qty(rec: dict) -> float:
+        try:
+            return float((rec.get("data") or {}).get("o", {}).get("q", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    with gzip.open(raw_path, "rt") as fh:
+        for ln in fh:
+            rec = json.loads(ln)
+            if rec.get("type") != "liquidation":
+                continue
+            ts_sec = _ts_sec(rec)
+            if ts_sec is None:
+                continue
+            side = _side(rec)
+            qty = _qty(rec)
+            agg[ts_sec]["count"] += 1
+            if side == "BUY":
+                agg[ts_sec]["buy"] += qty
+            elif side == "SELL":
+                agg[ts_sec]["sell"] += qty
+
+    return _liquidations_to_df(bar_index, agg)
+
+
+def _liquidations_to_df(bar_index: pd.DatetimeIndex, agg: dict) -> pd.DataFrame:
+    """Build DataFrame with bar_index; agg keys are integer second timestamps."""
+    liq_vol_buy = pd.Series(0.0, index=bar_index)
+    liq_vol_sell = pd.Series(0.0, index=bar_index)
+    liq_count = pd.Series(0, index=bar_index)
+    for ts in bar_index:
+        sec = int(ts.timestamp())
+        if sec in agg:
+            liq_vol_buy.loc[ts] = agg[sec]["buy"]
+            liq_vol_sell.loc[ts] = agg[sec]["sell"]
+            liq_count.loc[ts] = agg[sec]["count"]
+    return pd.DataFrame({"liq_vol_buy": liq_vol_buy, "liq_vol_sell": liq_vol_sell, "liq_count": liq_count})
+
+
+def _add_liquidation_columns(df_bars: pd.DataFrame, raw_path: Path) -> None:
+    """Add liq_vol_buy, liq_vol_sell, liq_count to df_bars from raw block file."""
+    agg = _aggregate_liquidations_from_raw(raw_path, df_bars.index)
+    df_bars["liq_vol_buy"] = agg["liq_vol_buy"].values
+    df_bars["liq_vol_sell"] = agg["liq_vol_sell"].values
+    df_bars["liq_count"] = agg["liq_count"].values
+
+
+def enrich_bars_with_aux(
+    df_bars: pd.DataFrame,
+    symbol: str,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    raw_path: Path,
+    settings: Settings,
+) -> pd.DataFrame:
+    """
+    Add 1s-aligned columns: funding_rate, open_interest, liq_vol_buy, liq_vol_sell, liq_count.
+    Same index as df_bars; missing data yields NaN (funding/OI) or 0 (liquidations).
+    """
+    if df_bars.empty:
+        return df_bars
+
+    # Ensure index is datetime for reindex
+    if not isinstance(df_bars.index, pd.DatetimeIndex):
+        df_bars = df_bars.copy()
+        df_bars.index = pd.to_datetime(df_bars.index, utc=True)
+
+    start_ts = pd.Timestamp(start_ts)
+    end_ts = pd.Timestamp(end_ts)
+    enc = settings.enrichment
+
+    _add_funding_column(df_bars, symbol, start_ts, end_ts, enc.funding_dir)
+    _add_oi_column(df_bars, symbol, start_ts, end_ts, enc.oi_dir)
+    _add_liquidation_columns(df_bars, raw_path)
+
+    return df_bars

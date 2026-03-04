@@ -1,0 +1,31 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Data / capture artifacts
+data/
+datasets/
+raw/
+captures/
+*.gz
+*.bz2
+*.zst
+*.parquet
+*.feather
+*.csv
+*.jsonl
+*.sqlite
+*.db
+
+# Logs
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

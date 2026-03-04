@@ -1,0 +1,44 @@
+project_name: lob-demo
+symbols: ["BTCUSDT"]
+
+source:
+  venue: binance-futures        # used for catalog + Spaces paths
+  market: futures               # passed into main_capture_loop ("spot" or "futures")
+
+capture:
+  depth_endpoint: "wss://stream.binance.com/ws/{sym_lower}@depth@100ms"
+  trade_endpoint: "wss://stream.binance.com/ws/{sym_lower}@trade"
+  snapshot_endpoint: "https://api.binance.com/api/v3/depth?symbol={sym}&limit={limit}"
+
+  fut_depth_endpoint: "wss://fstream.binance.com/ws/{sym_lower}@depth@100ms"
+  fut_trade_endpoint: "wss://fstream.binance.com/ws/{sym_lower}@trade"
+  fut_snapshot_endpoint: "https://fapi.binance.com/fapi/v1/depth?symbol={sym}&limit={limit}"
+
+  depth_limit: 1000
+  reconnect_delay: 3
+  raw_dir: "./data/raw"
+  fut_force_order_endpoint: "wss://fstream.binance.com/ws/{sym_lower}@forceOrder"
+
+enrichment:
+  enabled: true
+  funding_dir: "./data/funding"
+  oi_dir: "./data/oi"
+
+bars:
+  intervals: ["1s"]
+  bucket_usd: 50
+
+storage:
+  provider: do_spaces
+  bucket: lobste-data
+  region: sgp1
+  endpoint: "https://sgp1.digitaloceanspaces.com"
+  csv_prefix: "csv/v1"
+  parquet_prefix: "parquet/v1"
+
+catalog:
+  type: sqlite
+  path: "./catalog.db"
+
+logging:
+  level: INFO
